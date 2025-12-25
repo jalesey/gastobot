@@ -1,6 +1,8 @@
 import os
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from services.sheets import append_gasto
+import traceback
 
 def get_token() -> str:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -43,6 +45,7 @@ def parse_gasto(texto: str):
     return descripcion, monto
 
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    
     texto = (update.message.text or "").strip()
     parsed = parse_gasto(texto)
 
@@ -56,11 +59,27 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     descripcion, monto = parsed
-    await update.message.reply_text(
-        f"✅ Registrado (por ahora solo confirmo):\n"
-        f"- Descripción: {descripcion}\n"
-        f"- Monto: {monto}"
-    )
+    
+    username = update.effective_user.username or update.effective_user.first_name or "sin_usuario"
+    chat_id = update.effective_chat.id
+
+
+    try:
+        append_gasto(descripcion, monto, username, str(chat_id))
+        await update.message.reply_text(
+            f"✅ Guardado en Google Sheets:\n- {descripcion}\n- ${monto}"
+        )
+    except Exception as e:
+        # 1) Log completo en consola (VS Code terminal)
+        print("ERROR guardando en Sheets:")
+        traceback.print_exc()
+
+        # 2) Mensaje útil en Telegram (tipo + repr)
+        await update.message.reply_text(
+            "❌ No pude guardar en Sheets.\n"
+            f"Tipo: {type(e).__name__}\n"
+            f"Detalle: {repr(e)}"
+        )
 
 def main() -> None:
     # Cargar .env manualmente (sin librerías extra)
