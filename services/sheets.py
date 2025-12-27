@@ -58,9 +58,9 @@ def upsert_mapping(comercio_raw: str, alias: str, categoria: str | None = None):
     for idx, row in enumerate(values[1:], start=2):
         raw = (row[0] if len(row) > 0 else "").strip().upper()
         if raw == target:
-            ws.update(f"B{idx}", alias)
+            ws.update_acell(f"B{idx}", alias)
             if categoria is not None:
-                ws.update(f"C{idx}", categoria)
+                ws.update_acell(f"C{idx}", categoria)
             return
 
     ws.append_row([comercio_raw, alias, categoria or ""], value_input_option="USER_ENTERED")
@@ -122,4 +122,4 @@ def get_pendiente(email_id: str):
 def mark_pendiente_ok(row_index: int):
     """Marca estado = OK en hoja Pendientes (columna G)."""
     ws = _open_ws("Pendientes")
-    ws.update(f"G{row_index}", "OK")
+    ws.update_acell(f"G{row_index}", "OK")
