@@ -5,113 +5,296 @@ from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import CallbackQueryHandler
+
 from services.sheets import (
     get_pendiente,
     mark_pendiente_ok,
     append_gasto,
     upsert_mapping,
+    get_unique_categories
 )
 
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import CallbackQueryHandler
+def build_category_keyboard(email_id):
+    # 1. Obtenemos las categorías actuales (Fijas + Las que aprendió el Excel)
+    cats = get_unique_categories()
+    
+    keyboard = []
+    row = []
+    
+    # 2. Creamos botones de a 2 por fila
+    for cat in cats:
+        btn = InlineKeyboardButton(cat, callback_data=f"CAT|{email_id}|{cat}")
+        row.append(btn)
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    
+    # Si quedó uno suelto, lo agregamos
+    if row:
+        keyboard.append(row)
+        
+    # 3. Agregamos el botón para CREAR UNA NUEVA
+    keyboard.append([
+        InlineKeyboardButton("➕ Nueva Categoría...", callback_data=f"NEW_CAT|{email_id}")
+    ])
+    
+    # 4. Botón de cancelar
+    keyboard.append([
+        InlineKeyboardButton("❌ Cancelar", callback_data=f"IGNORE|{email_id}")
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
 
 # 1. Modificamos button_handler para guardar el ID del mensaje
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer() # Avisa a Telegram que se recibió el clic
+    
     data = query.data
     parts = data.split("|")
     action = parts[0]
+    email_id = parts[1] if len(parts) > 1 else None
 
+    # --- CASO 1: DESCARTAR ---
     if action == "IGNORE":
         await query.edit_message_text(text="❌ Gasto descartado.")
         return
 
-    if action == "OTRO":
-        email_id = parts[1]
+    # --- CASO 2: MANTENER NOMBRE ORIGINAL (NUEVO) ---
+    if action == "KEEP":
+        # Feedback visual inmediato
+        await query.edit_message_text(text="⏳ Cargando categorías...")
+
+        # 1. Obtenemos el nombre original desde Sheets
+        row_idx, p = get_pendiente(email_id)
+        if not p:
+            await query.edit_message_text(text="⚠️ Error: No encontré el gasto en Pendientes.")
+            return
+            
+        alias_original = p["comercio_raw"]
+        
+        # 2. Guardamos este alias en memoria (como si lo hubieras escrito)
+        context.user_data["temp_alias"] = alias_original
         context.user_data["esperando_categoria_id"] = email_id
         
-        # Guardamos el ID del mensaje para editarlo después
+        # 3. Mostramos DIRECTAMENTE los botones de categoría
+        # USAMOS EL TECLADO DINÁMICO
+        reply_markup = build_category_keyboard(email_id) 
+
+        await query.edit_message_text(
+            text=f"✅ Alias: <b>{alias_original}</b>\n\n📂 Selecciona la <b>CATEGORÍA</b>:",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+        return
+    
+    # --- CASO: NUEVA CATEGORÍA (Botón ➕) ---
+    if action == "NEW_CAT":
+        email_id = parts[1]
+        await query.edit_message_text(text="✍️ Escribe el nombre de la <b>NUEVA CATEGORÍA</b>:", parse_mode="HTML")
+        
+        # Guardamos estado para esperar texto
+        context.user_data["esperando_nueva_cat_id"] = email_id
+        context.user_data["mensaje_instruccion_id"] = query.message.message_id
+        return
+
+    # --- CASO 3: CAMBIAR NOMBRE MANUALMENTE ---
+    if action == "OTRO":
+        # Feedback visual
+        await query.edit_message_text(text="🔍 Preparando...")
+        
+        # Guardamos estado: Esperamos que el usuario escriba un ALIAS
+        context.user_data["esperando_alias_id"] = email_id
+        # Guardamos ID del mensaje para editarlo después
         context.user_data["mensaje_instruccion_id"] = query.message.message_id
         
         row_idx, p = get_pendiente(email_id)
-        nombre = p["comercio_raw"] if p else "este comercio"
+        nombre_banco = p["comercio_raw"] if p else "este comercio"
 
         await query.edit_message_text(
-            text=f"✍️ Escribe la categoría para <b>{nombre}</b>:",
+            text=f"✍️ <b>Nuevo Alias:</b>\nEscribe cómo quieres llamar a: <i>{nombre_banco}</i>",
             parse_mode="HTML"
         )
         return
 
+    # --- CASO 4: SELECCIONAR CATEGORÍA ---
     if action == "CAT":
-        await procesar_gasto(update, context, parts[1], parts[2])
-
-
+        # Feedback visual
+        await query.edit_message_text(text="⏳ Guardando en Sheets...")
+        
+        categoria_seleccionada = parts[2]
+        
+        # Recuperamos el alias que guardamos en el paso anterior (KEEP o OTRO)
+        alias_guardado = context.user_data.get("temp_alias")
+        
+        # Limpieza de memoria
+        context.user_data.pop("esperando_alias_id", None)
+        context.user_data.pop("esperando_categoria_id", None)
+        context.user_data.pop("temp_alias", None)
+        
+        # Procesamos
+        await procesar_gasto(
+            update, context, 
+            email_id, 
+            categoria_seleccionada, 
+            alias_manual=alias_guardado
+        )
 
 # 2. Modificamos on_text para borrar el mensaje de instrucción viejo
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 👇 ESTA ES LA LÍNEA NUEVA PARA VER LOS IDs
-    print(f"📩 MENSAJE RECIBIDO: ID={update.message.message_id} | TEXTO='{update.message.text}'")
+    # Verificamos estado
+    esperando_alias_email = context.user_data.get("esperando_alias_id")
+    esperando_cat_email = context.user_data.get("esperando_categoria_id")
+    esperando_nueva_cat_email = context.user_data.get("esperando_nueva_cat_id")
+    
+    mensaje_instruccion_id = context.user_data.get("mensaje_instruccion_id")
+    chat_id = update.effective_chat.id
 
-    # Recuperamos los datos de la memoria
-    email_id_pendiente = context.user_data.get("esperando_categoria_id")
-    mensaje_id_a_editar = context.user_data.get("mensaje_instruccion_id")
-
-    if email_id_pendiente:
-        nueva_categoria = update.message.text.strip()
+    # --- PASO 1: RECIBIMOS EL ALIAS ---
+    if esperando_alias_email:
+        nuevo_alias = update.message.text.strip()
         
-        # 1. Borramos TU mensaje (el que dice "TV") para limpiar
-        try:
-            await update.message.delete()
-            print("   ✅ Mensaje del usuario borrado.")
-        except Exception as e:
-            print(f"   ⚠️ No pude borrar el mensaje del usuario: {e}") 
+        # Feedback visual rápido
+        temp_msg = await update.message.reply_text("🔄 Generando opciones de categoría...")
+        
+        # 1. Borramos tu mensaje
+        
+        try: await update.message.delete()
+        except: pass
 
-        # 2. Llamamos a procesar pasando el ID para que EDITE el mensaje del bot
-        if mensaje_id_a_editar:
-             print(f"   ℹ️ Intentando editar mensaje del bot ID={mensaje_id_a_editar}...")
+        # 2. Guardamos Alias
+        context.user_data["temp_alias"] = nuevo_alias
+        
+        # 3. Cambiamos estado: Ahora esperamos CATEGORÍA
+        del context.user_data["esperando_alias_id"]
+        context.user_data["esperando_categoria_id"] = esperando_alias_email
+
+        # 4. DEFINIMOS LOS BOTONES (Igual que en Apps Script)
+        # Usamos el email_id actual para que el botón sepa qué gasto es
+        eid = esperando_alias_email 
+       # --- NUEVO MENÚ DE BOTONES ---
+
+        reply_markup = build_category_keyboard(esperando_alias_email)   
+
+        # 5. Actualizamos el mensaje preguntando la categoría + BOTONES
+        texto_siguiente = (
+            f"✅ Alias guardado: <b>{nuevo_alias}</b>\n\n"
+            f"✍️ <b>Paso 2/2:</b>\n"
+            f"Selecciona la <b>CATEGORÍA</b> o escríbela:"
+        )
+        
+        if mensaje_instruccion_id:
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id, 
+                    message_id=mensaje_instruccion_id,
+                    text=texto_siguiente, 
+                    parse_mode="HTML",
+                    reply_markup=reply_markup # <--- AQUÍ AGREGAMOS LOS BOTONES
+                )
+                await temp_msg.delete()
+            except:
+                msg = await context.bot.send_message(
+                    chat_id=chat_id, 
+                    text=texto_siguiente, 
+                    parse_mode="HTML",
+                    reply_markup=reply_markup
+                )
+                context.user_data["mensaje_instruccion_id"] = msg.message_id
+        else:
+             msg = await context.bot.send_message(
+                    chat_id=chat_id, 
+                    text=texto_siguiente, 
+                    parse_mode="HTML",
+                    reply_markup=reply_markup
+                )
+        return
+    
+
+    if esperando_nueva_cat_email:
+        nueva_cat_texto = update.message.text.strip().title() # Ej: "Viajes"
+        
+        # Feedback visual rápido
+        temp_msg = await update.message.reply_text("🔄 Creando categoría...")
+        
+        # 1. Borramos tu mensaje
+        
+        try: await update.message.delete()
+        except: pass
+
+        
+        # Recuperamos el alias que ya teníamos guardado
+        alias_final = context.user_data.get("temp_alias")
+        
+        # Procesamos el gasto con la NUEVA categoría
+        # Al procesarlo, upsert_mapping guardará "Viajes" en la hoja Comercios.
+        # La próxima vez que llames a get_unique_categories(), "Viajes" aparecerá.
+        await procesar_gasto(
+            update, context,
+            esperando_nueva_cat_email,
+            nueva_cat_texto,
+            mensaje_id_to_edit=mensaje_instruccion_id,
+            alias_manual=alias_final
+        )
+        
+        # Limpieza
+        context.user_data.pop("esperando_nueva_cat_id", None)
+        context.user_data.pop("mensaje_instruccion_id", None)
+        context.user_data.pop("temp_alias", None)
+        return
+
+    # --- PASO 2: RECIBIMOS LA CATEGORÍA (MANUALMENTE) ---
+    if esperando_cat_email:
+        nueva_categoria = update.message.text.strip()
+        alias_final = context.user_data.get("temp_alias")
+
+        try: await update.message.delete()
+        except: pass
 
         await procesar_gasto(
             update, context, 
-            email_id_pendiente, 
+            esperando_cat_email, 
             nueva_categoria, 
-            mensaje_id_to_edit=mensaje_id_a_editar
+            mensaje_id_to_edit=mensaje_instruccion_id,
+            alias_manual=alias_final
         )
         
-        # Limpiamos la memoria
-        del context.user_data["esperando_categoria_id"]
-        if "mensaje_instruccion_id" in context.user_data:
-            del context.user_data["mensaje_instruccion_id"]
+        # Limpieza
+        context.user_data.pop("esperando_categoria_id", None)
+        context.user_data.pop("temp_alias", None)
+        context.user_data.pop("mensaje_instruccion_id", None)
         return
 
-    # Si escriben sin estar en modo espera
     await update.message.reply_text("Te leo 👀 Esperando gastos...")
 
 # 3. Función auxiliar para procesar y responder bonito
-async def procesar_gasto(update, context, email_id, categoria, mensaje_id_to_edit=None):
+async def procesar_gasto(update, context, email_id, categoria, mensaje_id_to_edit=None, alias_manual=None):
     chat_id = update.effective_chat.id
     row_idx, p = get_pendiente(email_id)
     
     if not p:
-        # Si no existe, intentamos avisar editando o enviando nuevo
         msg = "⚠️ Ya no encuentro ese gasto pendiente."
-        if update.callback_query:
-             await update.callback_query.edit_message_text(msg)
-        elif mensaje_id_to_edit:
-             try:
-                await context.bot.edit_message_text(chat_id=chat_id, message_id=mensaje_id_to_edit, text=msg)
-             except:
-                await context.bot.send_message(chat_id=chat_id, text=msg)
-        else:
-             await context.bot.send_message(chat_id=chat_id, text=msg)
+        if update.callback_query: await update.callback_query.edit_message_text(msg)
+        elif mensaje_id_to_edit: 
+            try: await context.bot.edit_message_text(chat_id=chat_id, message_id=mensaje_id_to_edit, text=msg)
+            except: await context.bot.send_message(chat_id=chat_id, text=msg)
         return
 
     # Datos
     comercio_raw = p["comercio_raw"]
-    alias = comercio_raw.title().strip() 
     monto = p["monto"]
     
-    # Guardar
+    # --- LÓGICA DEL ALIAS ---
+    # Si nos dieron un manual (Paso 1), lo usamos. Si no, generamos automático.
+    if alias_manual:
+        alias = alias_manual
+    else:
+        alias = comercio_raw.title().strip()
+
+    # Guardar en Sheets
     append_gasto(
         fecha=p["fecha_email"], hora=p["hora_email"], descripcion=p["desc"], monto=monto,
         categoria=categoria, comercio_raw=comercio_raw, comercio_alias=alias,
@@ -122,31 +305,24 @@ async def procesar_gasto(update, context, email_id, categoria, mensaje_id_to_edi
 
     # Texto Final
     texto_final = (
-        f"✅ <b>Listo.</b> Gasto de <b>${monto}</b> en {alias}\n"
-        f"📂 Clasificado como: <b>{categoria}</b>"
+        f"✅ <b>Listo.</b> Gasto de <b>${monto}</b>\n"
+        f"🏪 <b>{alias}</b>\n"
+        f"📂 <b>{categoria}</b>"
     )
     
-    # --- INTENTO DE EDICIÓN ---
+    # Actualizar mensaje
     try:
         if update.callback_query:
-            # Caso fácil: Botón
             await update.callback_query.edit_message_text(text=texto_final, parse_mode="HTML")
-        
         elif mensaje_id_to_edit:
-            # Caso difícil: Texto manual -> Editamos por ID
             await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=mensaje_id_to_edit,
-                text=texto_final,
-                parse_mode="HTML"
+                chat_id=chat_id, message_id=mensaje_id_to_edit,
+                text=texto_final, parse_mode="HTML"
             )
         else:
-            # Fallback
             await context.bot.send_message(chat_id=chat_id, text=texto_final, parse_mode="HTML")
-
     except Exception as e:
-        # Si falla la edición (raro), enviamos uno nuevo para no perder la confirmación
-        print(f"Error editando: {e}")
+        print(f"Error finalizando mensaje: {e}")
         await context.bot.send_message(chat_id=chat_id, text=texto_final, parse_mode="HTML")
 
 def load_env():

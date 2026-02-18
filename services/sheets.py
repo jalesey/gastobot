@@ -5,6 +5,36 @@ from google.oauth2.service_account import Credentials
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
+def get_unique_categories():
+    """
+    Retorna una lista de categorías únicas encontradas en la hoja 'Comercios' (Columna C),
+    más las básicas por defecto.
+    """
+    map_tab = os.getenv("GOOGLE_MAP_TAB", "Comercios")
+    ws = _open_ws(map_tab)
+    
+    # Obtenemos toda la columna C (Categorías)
+    # Asumimos que la columna C es la 3ra (índice 2, pero gspread usa 1-based para col_values o get_all_values)
+    # Es más seguro traer todo y procesar en python
+    values = ws.get_all_values()
+    
+    categorias_encontradas = set()
+    
+    # Recorremos desde la fila 1 (saltando encabezado)
+    for row in values[1:]:
+        if len(row) > 2:
+            cat = row[2].strip()
+            if cat:
+                categorias_encontradas.add(cat)
+    
+    # Categorías base que SIEMPRE queremos que estén
+    base = ["Comida", "Supermercado", "Salud", "Transporte", "Hogar", "Ocio"]
+    
+    # Unimos las base con las encontradas
+    todas = set(base).union(categorias_encontradas)
+    
+    return sorted(list(todas))
+
 def get_client():
     sa_path = os.getenv("GOOGLE_SA_JSON", "secrets/service_account.json")
     if not os.path.exists(sa_path):
