@@ -5,6 +5,32 @@ from google.oauth2.service_account import Credentials
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
 
+def get_usuarios_autorizados() -> set[int]:
+    ws = _open_ws("Usuarios")
+    values = ws.get_all_values()
+    return {
+        int(row[0]) for row in values[1:]
+        if len(row) > 2 and row[2].strip().upper() == "AUTORIZADO"
+    }
+
+def upsert_usuario(chat_id: int, nombre: str, estado: str):
+    from datetime import date
+    ws = _open_ws("Usuarios")
+    values = ws.get_all_values()
+    target = str(chat_id)
+
+    for idx, row in enumerate(values[1:], start=2):
+        if str(row[0]).strip() == target:
+            ws.update_acell(f"B{idx}", nombre)
+            ws.update_acell(f"C{idx}", estado)
+            return
+
+    ws.append_row(
+        [str(chat_id), nombre, estado, str(date.today())],
+        value_input_option="USER_ENTERED"
+    )
+
+
 def get_unique_categories():
     """
     Retorna una lista de categorías únicas encontradas en la hoja 'Comercios' (Columna C),

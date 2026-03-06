@@ -14,8 +14,66 @@ from services.sheets import (
     append_gasto,
     upsert_mapping,
     get_unique_categories,
-    get_mapping
+    get_mapping, get_usuarios_autorizados, upsert_usuario
 )
+
+ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
+
+_auth_cache = {"ids": set(), "ts": 0}
+
+def is_authorized(update: Update) -> bool:
+    import time
+    ahora = time.time()
+    
+    if ahora - _auth_cache["ts"] > 120:   # ¿Pasaron más de 60s?
+        _auth_cache["ids"] = get_usuarios_autorizados()  # → consulta Sheets
+        _auth_cache["ts"] = ahora                        # → resetea el reloj
+    
+    return update.effective_chat.id in _auth_cache["ids"]  # usa lo que hay en memoria
+
+async def request_access(update: Update):
+    """Notifica al admin cuando alguien desconocido escribe."""
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+    nombre = user.full_name or user.username or str(chat_id)
+
+    # Guardamos como PENDIENTE
+    upsert_usuario(chat_id, nombre, "PENDIENTE")
+
+    # Notificamos al admin con botones
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"✅ Aprobar a {nombre}", 
+                callback_data=f"AUTH_OK|{chat_id}|{nombre}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"❌ Rechazar", 
+                callback_data=f"AUTH_DENY|{chat_id}|{nombre}"
+            )
+        ]
+    ])
+
+    from telegram import Bot
+    bot = update.get_bot()
+    await bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=f"🔔 <b>Solicitud de acceso:</b>\n"
+             f"👤 {nombre}\n"
+             f"🆔 <code>{chat_id}</code>",
+        parse_mode="HTML",
+        reply_markup=keyboard
+    )
+
+    # Le avisamos al usuario que está esperando
+    await update.message.reply_text(
+        "⏳ Tu solicitud fue enviada al administrador. "
+        "Te avisaré cuando seas aprobado."
+    )
+
+
 
 def build_category_keyboard(email_id):
     # 1. Obtenemos las categorías actuales (Fijas + Las que aprendió el Excel)
@@ -51,6 +109,9 @@ def build_category_keyboard(email_id):
 # 1. Modificamos button_handler para guardar el ID del mensaje
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.callback_query.answer("⛔ No autorizado.", show_alert=True)
+        return
     query = update.callback_query
     await query.answer() # Avisa a Telegram que se recibió el clic
     
@@ -58,6 +119,32 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = data.split("|")
     action = parts[0]
     email_id = parts[1] if len(parts) > 1 else None
+
+    if action == "AUTH_OK":
+        target_chat_id = int(parts[1])
+        nombre = parts[2] if len(parts) > 2 else str(target_chat_id)
+
+        upsert_usuario(target_chat_id, nombre, "AUTORIZADO")
+        
+        _auth_cache["ts"] = 0
+        await query.edit_message_text(f"✅ {nombre} autorizado.")
+        
+
+        # Avisamos al usuario aprobado
+        await context.bot.send_message(
+            chat_id=target_chat_id,
+            text="✅ ¡Acceso aprobado! Ya puedes usar el bot."
+        )
+        return
+
+    if action == "AUTH_DENY":
+        target_chat_id = int(parts[1])
+        nombre = parts[2] if len(parts) > 2 else str(target_chat_id)
+
+        upsert_usuario(target_chat_id, nombre, "RECHAZADO")
+
+        await query.edit_message_text(f"❌ {nombre} rechazado.")
+        return
 
     # --- CASO 1: DESCARTAR ---
     if action == "IGNORE":
@@ -181,6 +268,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # 2. Modificamos on_text para borrar el mensaje de instrucción viejo
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        return
     # Verificamos estado
     esperando_alias_email = context.user_data.get("esperando_alias_id")
     esperando_cat_email = context.user_data.get("esperando_categoria_id")
@@ -388,6 +477,9 @@ def now_local():
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ No autorizado.")
+    
     await update.message.reply_text(
         "Hola 👋 Soy tu bot de gastos.\n\n"
         "Cuando llegue un correo de BancoChile:\n"
@@ -436,6 +528,10 @@ def parse_clasificacion(text: str):
 
 
 async def clasificar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update):
+        await update.message.reply_text("⛔ No autorizado.")
+        return
+    
     msg = update.message.text or ""
     parsed = parse_clasificacion(msg)
 
