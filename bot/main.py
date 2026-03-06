@@ -13,7 +13,8 @@ from services.sheets import (
     mark_pendiente_ok,
     append_gasto,
     upsert_mapping,
-    get_unique_categories
+    get_unique_categories,
+    get_mapping
 )
 
 def build_category_keyboard(email_id):
@@ -142,6 +143,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             categoria_seleccionada, 
             alias_manual=alias_guardado
         )
+    if action == "CHECK":
+        await query.edit_message_text(text="🔍 Buscando en la base de datos...")
+        row_idx, p = get_pendiente(email_id)
+        print(p)
+        if not p:
+            await query.edit_message_text(text="⚠️ Error: No encontré el gasto en Pendientes.")
+            return
+        comercio_raw = p["comercio_raw"]
+        print(comercio_raw)
+        # Usamos tu función get_mapping para buscar en la hoja 'Comercios'
+        alias_encontrado, categoria_encontrada = get_mapping(comercio_raw)
+        if alias_encontrado and categoria_encontrada:
+            # Si existe, lo procesamos automáticamente con los datos guardados
+            await query.edit_message_text(text="✅ ¡Comercio encontrado! Registrando...")
+            await procesar_gasto(
+                update, context,
+                email_id,
+                categoria_encontrada,
+                alias_manual=alias_encontrado
+            )
+        else:
+            # Si no existe, volvemos a mostrar los botones para que lo clasifique
+            keyboard = [
+            [InlineKeyboardButton(f"✅ Mantener: {comercio_raw}", callback_data=f"KEEP|{email_id}")],
+            [InlineKeyboardButton("✏️ Asignar nuevo nombre...", callback_data=f"OTRO|{email_id}")],
+            [InlineKeyboardButton("❌ Ignorar", callback_data=f"IGNORE|{email_id}")]
+        ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+        
+            await query.edit_message_text(
+            text=f"❌ No encontré <b>{comercio_raw}</b> en tus registros.\n\n¿Qué deseas hacer?",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+            return
 
 # 2. Modificamos on_text para borrar el mensaje de instrucción viejo
 async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
