@@ -4,6 +4,14 @@ from google.oauth2.service_account import Credentials
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
+def get_estado_usuario(chat_id: int) -> str | None:
+    ws = _open_ws("Usuarios")
+    values = ws.get_all_values()
+    target = str(chat_id)
+    for row in values[1:]:
+        if str(row[0]).strip() == target:
+            return row[2].strip().upper() if len(row) > 2 else None
+    return None
 
 def get_usuarios_autorizados() -> set[int]:
     ws = _open_ws("Usuarios")

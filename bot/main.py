@@ -14,7 +14,7 @@ from services.sheets import (
     append_gasto,
     upsert_mapping,
     get_unique_categories,
-    get_mapping, get_usuarios_autorizados, upsert_usuario
+    get_mapping, get_usuarios_autorizados, upsert_usuario,get_estado_usuario
 )
 def load_env():
     env_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".env"))
@@ -48,6 +48,14 @@ async def request_access(update: Update):
     user = update.effective_user
     chat_id = update.effective_chat.id
     nombre = user.full_name or user.username or str(chat_id)
+
+    estado = get_estado_usuario(chat_id)
+    if estado == "PENDIENTE":
+        await update.message.reply_text("⏳ Tu solicitud ya fue enviada. Espera la aprobación.")
+        return
+    if estado == "RECHAZADO":
+        await update.message.reply_text("⛔ Tu acceso fue rechazado.")
+        return
 
     # Guardamos como PENDIENTE
     upsert_usuario(chat_id, nombre, "PENDIENTE")
